@@ -1,0 +1,17 @@
+{
+  "name": "crypton-bot",
+  "version": "1.0.0",
+  "description": "CRYPTON Telegram Registration Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "",
+  "license": "ISC"
+}
