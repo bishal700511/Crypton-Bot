@@ -1,47 +1,150 @@
 /**
  * ╔══════════════════════════════════════════════════════════╗
  * ║          CRYPTON — Telegram Registration Bot             ║
- * ║          Node.js  |  node-telegram-bot-api               ║
+ * ║          Node.js  |  node-telegram-bot-api + Firebase   ║
  * ╚══════════════════════════════════════════════════════════╝
  *
  * Setup:
- *   npm init -y
- *   npm install node-telegram-bot-api
+ *   npm install
  *   node index.js
+ *
+ * Required Environment Variables (set on Render.com):
+ *   BOT_TOKEN              — Telegram Bot Token
+ *   FIREBASE_PROJECT_ID    — e.g. crypton-app-871b1
+ *   FIREBASE_CLIENT_EMAIL  — from Firebase Service Account JSON
+ *   FIREBASE_PRIVATE_KEY   — from Firebase Service Account JSON (include \n)
  */
 
 const TelegramBot = require('node-telegram-bot-api');
+const admin       = require('firebase-admin');
 
-// ── Bot Token ────────────────────────────────────────────────
-const BOT_TOKEN = process.env.BOT_TOKEN || '8553132955:AAEfyUzW3KYX3Ey7M9kM3QqP2eN4Ax2hwNI';
+// ────────────────────────────────────────────────────────────
+// Firebase Admin SDK — init using Environment Variables
+// ────────────────────────────────────────────────────────────
+admin.initializeApp({
+  credential: admin.credential.cert({
+    projectId:   process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    // Render stores \n as literal \\n — replace it back
+    privateKey:  (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
+  }),
+});
 
-// ── App Base URL ─────────────────────────────────────────────
+const db = admin.firestore();
+console.log('[Firebase] Firestore Admin initialized ✓');
+
+// ────────────────────────────────────────────────────────────
+// Bot Token & App URL
+// ────────────────────────────────────────────────────────────
+const BOT_TOKEN    = process.env.BOT_TOKEN;
 const APP_BASE_URL = 'https://bishal700511.github.io/Crypton-App/';
 
-// ── Initialize Bot (polling mode) ───────────────────────────
+if (!BOT_TOKEN) {
+  console.error('❌ BOT_TOKEN environment variable is not set!');
+  process.exit(1);
+}
+
+// ────────────────────────────────────────────────────────────
+// Initialize Bot (polling mode)
+// ────────────────────────────────────────────────────────────
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 // ── In-memory session store  { chatId → sessionObject } ─────
-// For production, replace with Redis / Firebase / any DB.
 const sessions = {};
 
-/**
- * Session states:
- *   'AWAIT_NAME'   — waiting for user's full name
- *   'AWAIT_EMAIL'  — waiting for email address
- *   'DONE'         — registration complete
- */
+// ────────────────────────────────────────────────────────────
+// Helper — Get today's date in DD-MM-YYYY format
+// ────────────────────────────────────────────────────────────
+function getTodayDate() {
+  const now  = new Date();
+  const dd   = String(now.getDate()).padStart(2, '0');
+  const mm   = String(now.getMonth() + 1).padStart(2, '0');
+  const yyyy = now.getFullYear();
+  return `${dd}-${mm}-${yyyy}`;
+}
 
 // ────────────────────────────────────────────────────────────
-// /start  — entry point
+// Helper — Build App URL with URL Parameters
 // ────────────────────────────────────────────────────────────
-bot.onText(/\/start/, (msg) => {
+function buildAppUrl(tgUser, session) {
+  const userName  = encodeURIComponent(session.name  || '');
+  const userEmail = encodeURIComponent(session.email || '');
+  const tgHandle  = encodeURIComponent(
+    tgUser.username ? `@${tgUser.username}` : tgUser.first_name || 'User'
+  );
+  const tgID = encodeURIComponent(tgUser.id || '');
+  return `${APP_BASE_URL}?name=${userName}&email=${userEmail}&username=${tgHandle}&id=${tgID}`;
+}
+
+// ────────────────────────────────────────────────────────────
+// Helper — Check if user already registered in Firestore
+// Returns user data object or null
+// ────────────────────────────────────────────────────────────
+async function getRegisteredUser(tgId) {
+  try {
+    const docRef = db.collection('users').doc(String(tgId));
+    const snap   = await docRef.get();
+    return snap.exists ? snap.data() : null;
+  } catch (err) {
+    console.error('[Firestore] getRegisteredUser error:', err.message);
+    return null;
+  }
+}
+
+// ────────────────────────────────────────────────────────────
+// Helper — Save new user to Firestore
+// ────────────────────────────────────────────────────────────
+async function saveUser(tgUser, session) {
+  try {
+    const tgHandle = tgUser.username ? `@${tgUser.username}` : tgUser.first_name || 'User';
+    const docRef   = db.collection('users').doc(String(tgUser.id));
+    await docRef.set({
+      name:             session.name,
+      email:            session.email,
+      telegramId:       String(tgUser.id),
+      telegramHandle:   tgHandle,
+      registrationDate: getTodayDate(),
+      createdAt:        admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log(`[Firestore] User saved: ${tgHandle} (${tgUser.id})`);
+    return true;
+  } catch (err) {
+    console.error('[Firestore] saveUser error:', err.message);
+    return false;
+  }
+}
+
+// ────────────────────────────────────────────────────────────
+// /start — Entry point
+// ────────────────────────────────────────────────────────────
+bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
+  const tgUser = msg.from;
 
-  // Reset session on every /start
+  // Check if already registered in Firestore
+  const existingUser = await getRegisteredUser(tgUser.id);
+
+  if (existingUser) {
+    // ── Welcome Back flow ──────────────────────────────────
+    const appUrl = buildAppUrl(tgUser, existingUser);
+    await bot.sendMessage(
+      chatId,
+      `👋 Welcome back, *${existingUser.name}*! 🎉\n\nYou are already a member of CRYPTON Official.`,
+      { parse_mode: 'Markdown' }
+    );
+    await bot.sendMessage(chatId, '🚀 Open your app below:', {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '🔐 Open CRYPTON App', web_app: { url: appUrl } }
+        ]]
+      }
+    });
+    return;
+  }
+
+  // ── New user — start registration ─────────────────────────
   sessions[chatId] = { state: 'AWAIT_NAME' };
-
-  bot.sendMessage(
+  await bot.sendMessage(
     chatId,
     '👋 Welcome to Official Community of CRYPTON...\n\nPlease enter your Full Name:'
   );
@@ -54,15 +157,11 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text   = (msg.text || '').trim();
 
-  // Ignore commands (handled by onText above)
   if (text.startsWith('/')) return;
-
-  // Ignore button callbacks / non-text updates
   if (!text) return;
 
   const session = sessions[chatId];
 
-  // If no session exists, prompt user to start
   if (!session) {
     bot.sendMessage(chatId, '👋 Please send /start to begin registration.');
     return;
@@ -72,7 +171,6 @@ bot.on('message', async (msg) => {
   if (session.state === 'AWAIT_NAME') {
     session.name  = text;
     session.state = 'AWAIT_EMAIL';
-
     bot.sendMessage(
       chatId,
       `👍 Got it, ${session.name}! Now please enter your Email Address:`
@@ -82,7 +180,6 @@ bot.on('message', async (msg) => {
 
   // ── STATE: Waiting for Email ─────────────────────────────
   if (session.state === 'AWAIT_EMAIL') {
-    // Basic email validation
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(text)) {
       bot.sendMessage(
@@ -91,38 +188,27 @@ bot.on('message', async (msg) => {
       );
       return;
     }
-
     session.email = text;
     session.state = 'AWAIT_LINK';
 
-    // Step 3 — Show "Link 🔗 App" button
     bot.sendMessage(chatId, 'Please Link your Telegram', {
       reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: 'Link 🔗 App',
-              callback_data: 'LINK_TELEGRAM'
-            }
-          ]
-        ]
+        inline_keyboard: [[
+          { text: 'Link 🔗 App', callback_data: 'LINK_TELEGRAM' }
+        ]]
       }
     });
     return;
   }
 
-  // ── STATE: Done — ignore stray messages ──────────────────
+  // ── STATE: Done ───────────────────────────────────────────
   if (session.state === 'DONE') {
-    bot.sendMessage(chatId, '✅ You are already registered! Tap the button below to open the app.', {
+    const appUrl = buildAppUrl(msg.from, session);
+    bot.sendMessage(chatId, '✅ You are already registered! Tap below to open the app.', {
       reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: '🔐 Open CRYPTON App',
-              web_app: { url: buildAppUrl(msg.from, session) }  // ✅ Mini App
-            }
-          ]
-        ]
+        inline_keyboard: [[
+          { text: '🔐 Open CRYPTON App', web_app: { url: appUrl } }
+        ]]
       }
     });
     return;
@@ -134,12 +220,10 @@ bot.on('message', async (msg) => {
 // ────────────────────────────────────────────────────────────
 bot.on('callback_query', async (query) => {
   const chatId  = query.message.chat.id;
-  const msgId   = query.message.message_id;
   const data    = query.data;
   const tgUser  = query.from;
   const session = sessions[chatId];
 
-  // Always acknowledge the callback to stop the loading spinner
   await bot.answerCallbackQuery(query.id);
 
   if (data === 'LINK_TELEGRAM') {
@@ -148,50 +232,37 @@ bot.on('callback_query', async (query) => {
       return;
     }
 
-    // Mark session complete
-    session.state      = 'DONE';
-    session.tgHandle   = tgUser.username ? `@${tgUser.username}` : tgUser.first_name || 'User';
-    session.tgId       = tgUser.id;
+    // Save user to Firestore
+    const saved = await saveUser(tgUser, session);
+
+    if (!saved) {
+      bot.sendMessage(chatId, '⚠️ Could not save your data. Please try /start again.');
+      return;
+    }
+
+    // Update session
+    session.state    = 'DONE';
+    session.tgHandle = tgUser.username ? `@${tgUser.username}` : tgUser.first_name || 'User';
+    session.tgId     = tgUser.id;
 
     const appUrl = buildAppUrl(tgUser, session);
 
-    // Step 4 — Account created confirmation
+    // Confirmation message
     await bot.sendMessage(
       chatId,
       `✅ Account created successfully! Welcome to CRYPTON Official ${session.name}! 🎉`
     );
 
-    // Step 5 — Open App button (Mini App)
+    // Open App button
     await bot.sendMessage(chatId, '🚀 Your app is ready:', {
       reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: '🔐 Open CRYPTON App',
-              web_app: { url: appUrl }  // ✅ Mini App
-            }
-          ]
-        ]
+        inline_keyboard: [[
+          { text: '🔐 Open CRYPTON App', web_app: { url: appUrl } }
+        ]]
       }
     });
-
-    return;
   }
 });
-
-// ────────────────────────────────────────────────────────────
-// Helper — Build App URL with URL Parameters
-// ────────────────────────────────────────────────────────────
-function buildAppUrl(tgUser, session) {
-  const userName  = encodeURIComponent(session.name  || '');
-  const userEmail = encodeURIComponent(session.email || '');
-  const tgHandle  = encodeURIComponent(
-    tgUser.username ? `@${tgUser.username}` : tgUser.first_name || 'User'
-  );
-  const tgID      = encodeURIComponent(tgUser.id || '');
-
-  return `${APP_BASE_URL}?name=${userName}&email=${userEmail}&username=${tgHandle}&id=${tgID}`;
-}
 
 // ────────────────────────────────────────────────────────────
 // Polling error handler
