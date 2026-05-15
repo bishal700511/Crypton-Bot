@@ -1,13 +1,14 @@
 {
   "name": "crypton-bot",
   "version": "1.0.0",
-  "description": "CRYPTON Telegram Registration Bot",
+  "description": "CRYPTON Telegram Registration Bot with Firebase",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "node-telegram-bot-api": "^0.66.0"
+    "node-telegram-bot-api": "^0.66.0",
+    "firebase-admin": "^12.0.0"
   },
   "engines": {
     "node": ">=18.0.0"
