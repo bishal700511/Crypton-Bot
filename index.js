@@ -13,7 +13,7 @@
 const TelegramBot = require('node-telegram-bot-api');
 
 // ── Bot Token ────────────────────────────────────────────────
-const BOT_TOKEN = '8553132955:AAEfyUzW3KYX3Ey7M9kM3QqP2eN4Ax2hwNI';
+const BOT_TOKEN = process.env.BOT_TOKEN || '8553132955:AAEfyUzW3KYX3Ey7M9kM3QqP2eN4Ax2hwNI';
 
 // ── App Base URL ─────────────────────────────────────────────
 const APP_BASE_URL = 'https://bishal700511.github.io/Crypton-App/';
@@ -119,7 +119,7 @@ bot.on('message', async (msg) => {
           [
             {
               text: '🔐 Open CRYPTON App',
-              url: buildAppUrl(msg.from, session)
+              web_app: { url: buildAppUrl(msg.from, session) }  // ✅ Mini App
             }
           ]
         ]
@@ -161,14 +161,14 @@ bot.on('callback_query', async (query) => {
       `✅ Account created successfully! Welcome to CRYPTON Official ${session.name}! 🎉`
     );
 
-    // Step 5 — Open App button
+    // Step 5 — Open App button (Mini App)
     await bot.sendMessage(chatId, '🚀 Your app is ready:', {
       reply_markup: {
         inline_keyboard: [
           [
             {
               text: '🔐 Open CRYPTON App',
-              url: appUrl
+              web_app: { url: appUrl }  // ✅ Mini App
             }
           ]
         ]
