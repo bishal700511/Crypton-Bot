@@ -9,6 +9,16 @@ Required environment variables:
   BOT_TOKEN        – Telegram bot token
   FIREBASE_API_KEY – Firebase Web API key
 
+Data model — ONE document per user, Document ID = str(chat_id):
+  tgName        – full name entered during bot registration
+  tgEmail       – email entered during bot registration  (registration sentinel)
+  tgHandle      – Telegram @username (e.g. "@alice")
+  tgId          – Telegram chat ID as a STRING  (matches JS String(user.id))
+  walletAddress – blank "" on creation; app writes the TON wallet address later
+  earnedTon     – float, starts at 0
+  ownedSlots    – array, starts empty
+  joinedAt      – UTC RFC 3339 timestamp
+
 Registration flow (4-phase):
   Phase 1 (in-memory only) : collect name → email → show Link button.
   Phase 2 (Link button)    : verify session, update message to
@@ -22,15 +32,17 @@ Registration flow (4-phase):
                              with True Mini App button.
 
 A user is considered "fully registered" only when their Firestore document
-exists AND contains the 'email' field (sentinel for completion). Incomplete /
-missing documents restart registration.
+exists AND contains the 'tgEmail' field (sentinel for completion). Incomplete
+or missing documents restart registration.
 """
 
 import os
 import logging
+import threading
 import requests
 import telebot
 from telebot import types
+from flask import Flask
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -51,6 +63,21 @@ FIRESTORE_BASE = (
 APP_URL = "https://bishal700511.github.io/Crypton-App/"
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+
+# ── Dummy web server (keeps Render Web Service alive) ────────────────────────
+# Render requires a process to bind to a port; polling bots don't do that by
+# default and get killed.  This minimal Flask app runs on a daemon thread so
+# it never blocks the bot, and responds with 200 OK to Render's health checks.
+
+_flask_app = Flask(__name__)
+
+@_flask_app.get("/")
+def _health() -> tuple[str, int]:
+    return "CRYPTON bot is running.", 200
+
+def _run_web_server() -> None:
+    port = int(os.environ.get("PORT", 8080))
+    _flask_app.run(host="0.0.0.0", port=port)
 
 # ── In-memory registration state ─────────────────────────────────────────────
 # {
@@ -73,9 +100,9 @@ def _fs_url(collection: str, doc_id: str) -> str:
 def is_fully_registered(chat_id: int) -> bool:
     """
     Return True only when the Firestore document exists AND contains the
-    'email' field — the sentinel that marks a completed registration.
+    'tgEmail' field — the sentinel that marks a completed registration.
 
-    A document that is missing or lacks 'email' (e.g. left over from a
+    A document that is missing or lacks 'tgEmail' (e.g. left over from a
     previous broken flow) is treated as NOT registered.
     """
     url = _fs_url("users", str(chat_id))
@@ -85,7 +112,8 @@ def is_fully_registered(chat_id: int) -> bool:
             return False
         if resp.status_code == 200:
             fields = resp.json().get("fields", {})
-            return "email" in fields
+            # Sentinel: 'tgEmail' must exist — matches the field name the app reads
+            return "tgEmail" in fields
         logger.error(
             "Firestore GET unexpected status %s: %s", resp.status_code, resp.text
         )
@@ -112,19 +140,30 @@ def get_user(chat_id: int) -> dict | None:
 def create_user(chat_id: int, name: str, email: str, username: str | None) -> bool:
     """
     Write the complete, final user document to Firestore via REST PATCH.
-    Called ONLY when the user clicks the 'Account Created ◌' button
-    (Phase 3) — never during any earlier registration step.
+    Document ID  : str(chat_id)  — the single permanent user identity.
+    Field names  : aligned exactly with what index.html reads/writes.
+      tgName        – full name entered by the user
+      tgEmail       – email entered by the user  (sentinel: app checks for this)
+      tgHandle      – Telegram @username handle
+      tgId          – Telegram chat ID saved as a STRING (matches JS String())
+      walletAddress – blank on creation; the app writes the real address later
+      earnedTon     – initialised to 0
+      ownedSlots    – initialised to empty array
+      joinedAt      – server-side UTC timestamp
+    Called ONLY when the user clicks 'Account Created ◌' (Phase 3).
     """
     url = _fs_url("users", str(chat_id))
+    handle = f"@{username}" if username else ""
     payload = {
         "fields": {
-            "tgName":     {"stringValue": name},
-            "email":      {"stringValue": email},
-            "telegramId": {"integerValue": chat_id},
-            "username":   {"stringValue": username or ""},
-            "earnedTon":  {"doubleValue": 0},
-            "ownedSlots": {"arrayValue": {"values": []}},
-            "joinedAt":   {"timestampValue": _server_timestamp()},
+            "tgName":        {"stringValue": name},
+            "tgEmail":       {"stringValue": email},
+            "tgHandle":      {"stringValue": handle},
+            "tgId":          {"stringValue": str(chat_id)},
+            "walletAddress": {"stringValue": ""},
+            "earnedTon":     {"doubleValue": 0},
+            "ownedSlots":    {"arrayValue": {"values": []}},
+            "joinedAt":      {"timestampValue": _server_timestamp()},
         }
     }
     try:
@@ -378,5 +417,9 @@ def handle_final_create_callback(call: types.CallbackQuery) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Start the dummy web server on a background daemon thread so Render's
+    # port-binding check passes without interrupting the bot's polling loop.
+    web_thread = threading.Thread(target=_run_web_server, daemon=True)
+    web_thread.start()
     logger.info("CRYPTON bot starting (polling)…")
     bot.infinity_polling(timeout=30, long_polling_timeout=20)
