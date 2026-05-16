@@ -9,15 +9,21 @@ Required environment variables:
   BOT_TOKEN        – Telegram bot token
   FIREBASE_API_KEY – Firebase Web API key
 
-Fixes applied:
-  1. All app-launch buttons now use WebAppInfo so the Mini App opens
-     natively inside Telegram instead of an external browser pop-up.
-  2. Registration is two-phase:
-       • Phase 1 (in-memory only): collect name → email → wait for link.
-       • Phase 2 (Firestore write): only on successful "Link" button press.
-     A user is considered "fully registered" only when their Firestore
-     document exists AND contains the 'email' field (sentinel for
-     completion).  Incomplete / missing documents restart registration.
+Registration flow (4-phase):
+  Phase 1 (in-memory only) : collect name → email → show Link button.
+  Phase 2 (Link button)    : verify session, update message to
+                             "Verification Successfully Your Telegram To Link App"
+                             and swap button to "Account Created ◌"
+                             (callback: final_create_{chat_id}).
+                             NO Firestore write yet.
+  Phase 3 (Account Created): call create_user() — the ONLY Firestore write
+                             in the entire registration flow.
+  Phase 4 (welcome)        : clear user_state, send final launch message
+                             with True Mini App button.
+
+A user is considered "fully registered" only when their Firestore document
+exists AND contains the 'email' field (sentinel for completion). Incomplete /
+missing documents restart registration.
 """
 
 import os
@@ -47,8 +53,15 @@ APP_URL = "https://bishal700511.github.io/Crypton-App/"
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
 # ── In-memory registration state ─────────────────────────────────────────────
-# { chat_id: { "step": "name"|"email"|"link", "name": str, "email": str } }
-# Nothing is written to Firestore until the user clicks the Link button.
+# {
+#   chat_id: {
+#     "step"    : "name" | "email" | "link" | "final",
+#     "name"    : str,
+#     "email"   : str,
+#     "username": str | None,   # stored at Phase 2, used at Phase 3
+#   }
+# }
+# Nothing is written to Firestore until the user clicks "Account Created ◌".
 user_state: dict[int, dict] = {}
 
 # ── Firestore helpers ─────────────────────────────────────────────────────────
@@ -72,7 +85,6 @@ def is_fully_registered(chat_id: int) -> bool:
             return False
         if resp.status_code == 200:
             fields = resp.json().get("fields", {})
-            # Must have the email sentinel to count as fully registered
             return "email" in fields
         logger.error(
             "Firestore GET unexpected status %s: %s", resp.status_code, resp.text
@@ -100,8 +112,8 @@ def get_user(chat_id: int) -> dict | None:
 def create_user(chat_id: int, name: str, email: str, username: str | None) -> bool:
     """
     Write the complete, final user document to Firestore via REST PATCH.
-    Called ONLY after the user clicks the Link button — never during
-    the intermediate registration steps.
+    Called ONLY when the user clicks the 'Account Created ◌' button
+    (Phase 3) — never during any earlier registration step.
     """
     url = _fs_url("users", str(chat_id))
     payload = {
@@ -152,7 +164,7 @@ def open_app_markup() -> types.InlineKeyboardMarkup:
 
 
 def link_markup(chat_id: int) -> types.InlineKeyboardMarkup:
-    """The 'Link ✧' button triggers the final Firestore write via callback."""
+    """Phase 1 → Phase 2: 'Link ✧' button, triggers handle_link_callback."""
     kb = types.InlineKeyboardMarkup()
     kb.add(
         types.InlineKeyboardButton(
@@ -163,15 +175,17 @@ def link_markup(chat_id: int) -> types.InlineKeyboardMarkup:
     return kb
 
 
-def account_created_markup() -> types.InlineKeyboardMarkup:
+def account_created_markup(chat_id: int) -> types.InlineKeyboardMarkup:
     """
-    Post-registration launch button — also a True Mini App button.
+    Phase 2 → Phase 3: 'Account Created ◌' button shown after the Link
+    button is pressed.  Triggers handle_final_create_callback which is the
+    ONLY place Firestore is written.
     """
     kb = types.InlineKeyboardMarkup()
     kb.add(
         types.InlineKeyboardButton(
-            "🔐 Open CRYPTON App ❖",
-            web_app=types.WebAppInfo(url=APP_URL),
+            "Account Created ◌",
+            callback_data=f"final_create_{chat_id}",
         )
     )
     return kb
@@ -217,7 +231,6 @@ def handle_text(message: types.Message) -> None:
     state   = user_state.get(chat_id)
 
     if state is None:
-        # Not in a registration flow — prompt /start
         bot.send_message(chat_id, "Please type /start to begin.")
         return
 
@@ -231,7 +244,6 @@ def handle_text(message: types.Message) -> None:
                 chat_id, "Name cannot be empty. Please enter your full name."
             )
             return
-        # Store in memory only — no Firestore write yet.
         state["name"] = name
         state["step"] = "email"
         bot.send_message(
@@ -248,7 +260,6 @@ def handle_text(message: types.Message) -> None:
                 "That doesn't look like a valid email. Please try again.",
             )
             return
-        # Store in memory only — no Firestore write yet.
         state["email"] = email
         state["step"]  = "link"
         bot.send_message(
@@ -257,18 +268,21 @@ def handle_text(message: types.Message) -> None:
             reply_markup=link_markup(chat_id),
         )
 
-    elif step == "link":
-        # Waiting for the Link button — nothing to save yet; remind the user.
+    elif step in ("link", "final"):
+        # Waiting for an inline button press — remind the user.
         bot.send_message(
             chat_id,
-            "Please tap the '╭☞ Link ✧' button above to continue.",
+            "Please tap the button above to continue.",
         )
 
     else:
         bot.send_message(chat_id, "Please type /start to begin.")
 
 
-# ── Callback query handler ────────────────────────────────────────────────────
+# ── Phase 2: Link button callback ─────────────────────────────────────────────
+# Verifies session, stores username, advances step to "final", updates the
+# message in-place with new text + "Account Created ◌" button.
+# NO Firestore write happens here.
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("link_"))
 def handle_link_callback(call: types.CallbackQuery) -> None:
@@ -292,14 +306,53 @@ def handle_link_callback(call: types.CallbackQuery) -> None:
         )
         return
 
+    # Capture username now (available from call.from_user) for use in Phase 3.
+    state["username"] = call.from_user.username  # may be None
+    state["step"]     = "final"
+
+    bot.answer_callback_query(call.id, "Telegram linked ✓")
+
+    # Edit the existing message in-place: new text + swap button.
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=call.message.message_id,
+        text="Verification Successfully Your Telegram To Link App",
+        reply_markup=account_created_markup(chat_id),
+    )
+
+
+# ── Phase 3: Account Created button callback ──────────────────────────────────
+# This is the ONLY place create_user() / Firestore is called.
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("final_create_"))
+def handle_final_create_callback(call: types.CallbackQuery) -> None:
+    chat_id = call.message.chat.id
+
+    try:
+        callback_chat_id = int(call.data.split("_", 2)[2])
+    except (ValueError, IndexError):
+        bot.answer_callback_query(call.id, "Invalid request.")
+        return
+
+    # Security: only the owner of this registration may press the button.
+    if chat_id != callback_chat_id:
+        bot.answer_callback_query(call.id, "This button is not for you.")
+        return
+
+    state = user_state.get(chat_id)
+    if state is None or state.get("step") != "final":
+        bot.answer_callback_query(
+            call.id, "Session expired. Please type /start again."
+        )
+        return
+
     name     = state.get("name", "")
     email    = state.get("email", "")
-    username = call.from_user.username  # may be None
+    username = state.get("username")  # captured during Phase 2
 
-    bot.answer_callback_query(call.id, "Linking your Telegram…")
+    bot.answer_callback_query(call.id, "Creating your account…")
 
-    # ── Phase 2: Write the complete, final document to Firestore ─────────────
-    # This is the ONLY place we touch Firestore during registration.
+    # ── Phase 3: THE ONLY Firestore write in the registration flow ────────────
     success = create_user(chat_id, name, email, username)
 
     if not success:
@@ -311,30 +364,15 @@ def handle_link_callback(call: types.CallbackQuery) -> None:
         user_state.pop(chat_id, None)
         return
 
-    # Clear in-memory state — user is now fully registered in Firestore.
+    # ── Phase 4: Clear memory, send final welcome + launch button ─────────────
     user_state.pop(chat_id, None)
 
-    # ── Confirmation message ──────────────────────────────────────────────────
-    bot.send_message(
-        chat_id,
-        "✅ Your Telegram has been successfully linked to CRYPTON",
-        reply_markup=types.InlineKeyboardMarkup(rows=[
-            [types.InlineKeyboardButton("Account Created ◌", callback_data="noop")]
-        ]),
-    )
-
-    # ── Welcome / launch message with True Mini App button ───────────────────
     bot.send_message(
         chat_id,
         f"Welcome to CRYPTON Official, {name} ᴥ √\n"
         "Tap below to launch your app and start earning",
-        reply_markup=account_created_markup(),
+        reply_markup=open_app_markup(),
     )
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "noop")
-def handle_noop(call: types.CallbackQuery) -> None:
-    bot.answer_callback_query(call.id)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
